@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <array>
+#include <utility>
 
 #include <M5GFX.h>
 #include <IoExpanderXL9555.hpp>
@@ -31,6 +32,7 @@ constexpr int kPinEpdXcl = 16;
 
 constexpr int kPanelWidth = 960;
 constexpr int kPanelHeight = 540;
+constexpr uint8_t kPanelOffsetRotation = 3;
 }  // namespace board
 
 class LilyGoEPaperBasicDisplay : public lgfx::LGFX_Device
@@ -69,7 +71,7 @@ class LilyGoEPaperBasicDisplay : public lgfx::LGFX_Device
     panel_cfg.panel_width = board::kPanelWidth;
     panel_cfg.memory_height = board::kPanelHeight;
     panel_cfg.panel_height = board::kPanelHeight;
-    panel_cfg.offset_rotation = 3;
+    panel_cfg.offset_rotation = board::kPanelOffsetRotation;
     panel_cfg.offset_x = 0;
     panel_cfg.offset_y = 0;
     panel_cfg.bus_shared = false;
@@ -89,6 +91,8 @@ constexpr size_t kPageCount = 5;
 constexpr size_t kButtonCount = 5;
 constexpr uint8_t kCardDetectPin = 5;
 constexpr int kStatusHeight = 104;
+constexpr uint32_t kDebounceMs = 20;
+constexpr uint32_t kFastRefreshBurstLimit = 6;
 constexpr uint16_t kButtonMask = 0x001F;
 constexpr uint16_t kCardMask = (1U << kCardDetectPin);
 constexpr uint16_t kUsedInputMask = kButtonMask | kCardMask;
@@ -118,6 +122,14 @@ uint16_t last_sampled_port = 0xFFFF;
 uint32_t last_change_ms = 0;
 uint32_t full_refresh_count = 0;
 uint32_t partial_refresh_count = 0;
+uint32_t fast_full_refresh_streak = 0;
+
+struct DisplayRect {
+  int x = 0;
+  int y = 0;
+  int w = 0;
+  int h = 0;
+};
 
 int minInt(int a, int b)
 {
@@ -137,6 +149,59 @@ int statusTop()
 int contentHeight()
 {
   return statusTop() - contentTop() - 16;
+}
+
+DisplayRect logicalToNativeRect(int x, int y, int w, int h)
+{
+  uint_fast16_t xs = static_cast<uint_fast16_t>(x);
+  uint_fast16_t ys = static_cast<uint_fast16_t>(y);
+  uint_fast16_t xe = static_cast<uint_fast16_t>(x + w - 1);
+  uint_fast16_t ye = static_cast<uint_fast16_t>(y + h - 1);
+
+  const uint_fast8_t rotation = gfx.getRotation() & 7;
+  const uint_fast8_t internal_rotation =
+      ((rotation + board::kPanelOffsetRotation) & 3)
+      | ((rotation & 4) ^ (board::kPanelOffsetRotation & 4));
+
+  if (internal_rotation) {
+    if (internal_rotation & 1) {
+      std::swap(xs, ys);
+      std::swap(xe, ye);
+    }
+    const uint_fast8_t rotation_mask = 1 << internal_rotation;
+    if (rotation_mask & 0b11000110) {
+      std::swap(xs, xe);
+      xs = board::kPanelWidth - 1 - xs;
+      xe = board::kPanelWidth - 1 - xe;
+    }
+    if (rotation_mask & 0b10011100) {
+      std::swap(ys, ye);
+      ys = board::kPanelHeight - 1 - ys;
+      ye = board::kPanelHeight - 1 - ye;
+    }
+  }
+
+  DisplayRect native_rect;
+  native_rect.x = xs;
+  native_rect.y = ys;
+  native_rect.w = xe - xs + 1;
+  native_rect.h = ye - ys + 1;
+  return native_rect;
+}
+
+lgfx::epd_mode_t preferredPageRefreshMode(uint8_t page)
+{
+  switch (page) {
+    case 0:
+    case 3:
+      return lgfx::epd_text;
+    case 2:
+      return lgfx::epd_quality;
+    case 1:
+    case 4:
+    default:
+      return lgfx::epd_fast;
+  }
 }
 
 InputState decodeInput(uint16_t port_state)
@@ -419,11 +484,23 @@ void drawCurrentPage()
   drawStatusBar(current_input);
 }
 
-void refreshFull()
+void refreshFull(bool force_quality = false)
 {
   ++full_refresh_count;
   drawCurrentPage();
-  gfx.setEpdMode(lgfx::epd_quality);
+  lgfx::epd_mode_t refresh_mode = preferredPageRefreshMode(current_page);
+  const bool needs_maintenance_refresh = fast_full_refresh_streak >= kFastRefreshBurstLimit;
+  if (force_quality || needs_maintenance_refresh) {
+    refresh_mode = lgfx::epd_quality;
+  }
+
+  if (refresh_mode == lgfx::epd_quality) {
+    fast_full_refresh_streak = 0;
+  } else {
+    ++fast_full_refresh_streak;
+  }
+
+  gfx.setEpdMode(refresh_mode);
   gfx.display(0, 0, gfx.width(), gfx.height());
   gfx.waitDisplay();
 }
@@ -433,7 +510,11 @@ void refreshStatusOnly()
   ++partial_refresh_count;
   drawStatusBar(current_input);
   gfx.setEpdMode(lgfx::epd_fast);
-  gfx.display(0, statusTop(), gfx.width(), kStatusHeight);
+  // Panel_EPD expects native buffer coordinates for regional updates.
+  // The visible UI is rotated into portrait mode, so we convert the logical
+  // status bar rect before asking the driver to do a partial refresh.
+  const DisplayRect native_rect = logicalToNativeRect(0, statusTop(), gfx.width(), kStatusHeight);
+  gfx.display(native_rect.x, native_rect.y, native_rect.w, native_rect.h);
   gfx.waitDisplay();
 }
 
@@ -470,7 +551,7 @@ void pollExpander()
     return;
   }
 
-  if (millis() - last_change_ms < 30) {
+  if (millis() - last_change_ms < kDebounceMs) {
     return;
   }
 
@@ -528,7 +609,7 @@ void setup()
     last_sampled_port = io_expander.digitalReadPort() & kUsedInputMask;
     current_input = decodeInput(last_sampled_port);
     Serial.printf("XL9555 ready, initial port=0x%04X\n", current_input.port);
-    refreshFull();
+    refreshFull(true);
   } else {
     current_input = decodeInput(0xFFFF);
     Serial.println("XL9555 init failed");
