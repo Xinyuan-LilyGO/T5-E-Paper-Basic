@@ -288,7 +288,8 @@ DisplayRect logicalToNativeRect(int x, int y, int w, int h)
           static_cast<int>(xe - xs + 1), static_cast<int>(ye - ys + 1)};
 }
 
-void refreshLogicalRect(int x, int y, int w, int h)
+void refreshLogicalRect(int x, int y, int w, int h,
+                        lgfx::epd_mode_t mode = lgfx::epd_fast)
 {
   if (!screen_ready) {
     return;
@@ -298,7 +299,7 @@ void refreshLogicalRect(int x, int y, int w, int h)
   w = std::min(w, display.width() - x);
   h = std::min(h, display.height() - y);
   const DisplayRect rect = logicalToNativeRect(x, y, w, h);
-  display.setEpdMode(lgfx::epd_fast);
+  display.setEpdMode(mode);
   display.display(rect.x, rect.y, rect.w, rect.h);
   display.waitDisplay();
 }
@@ -421,11 +422,11 @@ void drawStartupPattern()
 
 void drawSectionFrame(int y, int h, const char* title, const char* english)
 {
-  display.fillRoundRect(kCenterX, y, kCenterW, h, 14, gray(247));
+  display.fillRoundRect(kCenterX, y, kCenterW, h, 14, TFT_WHITE);
   display.drawRoundRect(kCenterX, y, kCenterW, h, 14, TFT_BLACK);
   display.drawFastHLine(kCenterX + 14, y + 50, kCenterW - 28, TFT_BLACK);
   display.setTextDatum(textdatum_t::top_left);
-  display.setTextColor(TFT_BLACK, gray(247));
+  display.setTextColor(TFT_BLACK, TFT_WHITE);
   setUiFont(1, true);
   display.drawString(title, kCenterX + 18, y + 14);
   display.setFont(&fonts::Font2);
@@ -433,15 +434,21 @@ void drawSectionFrame(int y, int h, const char* title, const char* english)
   display.drawString(english, kCenterX + 154, y + 18);
 }
 
-void drawStatusBadge(int x, int y, int w, const String& text, bool dark)
+void drawStatusBadge(int x, int y, int w, const String& text, bool dark,
+                     bool ascii_text = false)
 {
   const uint32_t background = dark ? TFT_BLACK : TFT_WHITE;
   const uint32_t foreground = dark ? TFT_WHITE : TFT_BLACK;
   display.fillRoundRect(x, y, w, 30, 15, background);
   display.drawRoundRect(x, y, w, 30, 15, TFT_BLACK);
+  display.drawRoundRect(x + 1, y + 1, w - 2, 28, 14, TFT_BLACK);
   display.setTextDatum(textdatum_t::middle_center);
   display.setTextColor(foreground, background);
-  setUiFont(1, true);
+  if (ascii_text) {
+    display.setFont(&fonts::Font2);
+  } else {
+    setUiFont(1, true);
+  }
   display.drawString(text, x + w / 2, y + 15);
 }
 
@@ -494,11 +501,12 @@ String formatCapacity(uint64_t bytes)
 
 void drawSdIcon(int x, int y, bool active)
 {
-  const uint32_t fill = active ? TFT_BLACK : gray(225);
+  const uint32_t fill = active ? TFT_BLACK : TFT_WHITE;
   const uint32_t text = active ? TFT_WHITE : TFT_BLACK;
   display.fillRect(x, y + 12, 74, 92, fill);
-  display.fillTriangle(x + 50, y + 12, x + 74, y + 36, x + 74, y + 12, gray(247));
+  display.fillTriangle(x + 50, y + 12, x + 74, y + 36, x + 74, y + 12, TFT_WHITE);
   display.drawRect(x, y + 12, 74, 92, TFT_BLACK);
+  display.drawRect(x + 1, y + 13, 72, 90, active ? TFT_BLACK : TFT_WHITE);
   for (int pin = 0; pin < 5; ++pin) {
     display.fillRect(x + 9 + pin * 11, y + 22, 6, 20, text);
   }
@@ -516,25 +524,25 @@ void drawSdCard()
   bool badge_dark = false;
   switch (sd_result.state) {
     case SdState::kPassed:
-      badge = "通过";
+      badge = "PASS";
       badge_dark = true;
       break;
     case SdState::kFailed:
-      badge = "失败";
+      badge = "FAIL";
       break;
     case SdState::kNoCard:
-      badge = "无卡";
+      badge = "NO CARD";
       break;
     case SdState::kUnchecked:
     default:
-      badge = "检测中";
+      badge = "TEST";
       break;
   }
-  drawStatusBadge(kCenterX + kCenterW - 92, kSdY + 10, 72, badge, badge_dark);
+  drawStatusBadge(kCenterX + kCenterW - 108, kSdY + 10, 88, badge, badge_dark, true);
   drawSdIcon(kCenterX + 22, kSdY + 78, sd_result.state == SdState::kPassed);
 
   display.setTextDatum(textdatum_t::top_left);
-  display.setTextColor(TFT_BLACK, gray(247));
+  display.setTextColor(TFT_BLACK, TFT_WHITE);
   setUiFont(1);
   const int info_x = kCenterX + 120;
   const int info_y = kSdY + 69;
@@ -622,7 +630,7 @@ void drawNetworkRows(int first_y, size_t max_rows)
   setUiFont(1);
 
   if (rows == 0) {
-    display.setTextColor(TFT_BLACK, gray(247));
+    display.setTextColor(TFT_BLACK, TFT_WHITE);
     display.drawString(wifi_state == WifiState::kScanning ? "正在扫描附近 WiFi..." : "未扫描到 WiFi",
                        kCenterX + 20, first_y + 18);
     return;
@@ -630,10 +638,8 @@ void drawNetworkRows(int first_y, size_t max_rows)
 
   for (size_t index = 0; index < rows; ++index) {
     const int y = first_y + static_cast<int>(index) * 34;
-    if (index & 1U) {
-      display.fillRect(kCenterX + 14, y, kCenterW - 28, 33, gray(237));
-    }
-    display.setTextColor(TFT_BLACK, (index & 1U) ? gray(237) : gray(247));
+    display.fillRect(kCenterX + 14, y, kCenterW - 28, 33, TFT_WHITE);
+    display.setTextColor(TFT_BLACK, TFT_WHITE);
     display.setFont(&fonts::Font2);
     display.drawString(String(index + 1), kCenterX + 20, y + 16);
     setUiFont(1);
@@ -641,8 +647,8 @@ void drawNetworkRows(int first_y, size_t max_rows)
     display.drawString(fitText(ssid, 220), kCenterX + 48, y + 16);
     display.setFont(&fonts::Font2);
     display.drawString(String(wifi_networks[index].rssi) + " dBm", kCenterX + 292, y + 16);
-    drawSignalBars(kCenterX + 372, y + 27, wifi_networks[index].rssi, TFT_BLACK,
-                   (index & 1U) ? gray(237) : gray(247));
+    drawSignalBars(kCenterX + 372, y + 27, wifi_networks[index].rssi,
+                   TFT_BLACK, TFT_WHITE);
   }
 }
 
@@ -653,7 +659,7 @@ void drawWifiCard()
                   wifi_state == WifiState::kConnected);
 
   display.setTextDatum(textdatum_t::top_left);
-  display.setTextColor(TFT_BLACK, gray(247));
+  display.setTextColor(TFT_BLACK, TFT_WHITE);
   setUiFont(1);
 
   if (wifi_state == WifiState::kConnected) {
@@ -667,7 +673,7 @@ void drawWifiCard()
     display.drawString(String("信号：") + connected_rssi + " dBm", kCenterX + 32, panel_y + 76);
     drawSignalBars(kCenterX + 353, panel_y + 83, connected_rssi, TFT_WHITE, TFT_BLACK);
 
-    display.setTextColor(TFT_BLACK, gray(247));
+    display.setTextColor(TFT_BLACK, TFT_WHITE);
     setUiFont(1, true);
     display.drawString(String("附近网络（按信号排序，共 ") + wifi_network_count + " 个）",
                        kCenterX + 18, kWifiY + 181);
@@ -752,13 +758,13 @@ void refreshMainFull()
 void refreshSdCard()
 {
   drawSdCard();
-  refreshLogicalRect(kCenterX, kSdY, kCenterW, kSdH);
+  refreshLogicalRect(kCenterX, kSdY, kCenterW, kSdH, lgfx::epd_text);
 }
 
 void refreshWifiCard()
 {
   drawWifiCard();
-  refreshLogicalRect(kCenterX, kWifiY, kCenterW, kWifiH);
+  refreshLogicalRect(kCenterX, kWifiY, kCenterW, kWifiH, lgfx::epd_text);
 }
 
 bool inputEquals(const InputState& lhs, const InputState& rhs)
@@ -1012,7 +1018,7 @@ void handleStableInput(const InputState& previous)
                   stable_input.buttons[logical_index] ? "DOWN" : "UP");
     drawSideButton(visual_index);
     refreshLogicalRect(kButtonVisuals[visual_index].x, kButtonVisuals[visual_index].y,
-                       kButtonW, kButtonH);
+                       kButtonW, kButtonH, lgfx::epd_text);
   }
 
   if (previous.card_inserted != stable_input.card_inserted) {
