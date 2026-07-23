@@ -18,7 +18,8 @@ namespace board
 {
 constexpr int kPinI2cSda = 3;
 constexpr int kPinI2cScl = 2;
-constexpr int kPinExtIrq = 1;  // XL9555 INT# and KEY7 share this active-low line.
+constexpr int kPinExtIrq = 1;  // XL9555 active-low interrupt.
+constexpr int kPinBoot = 0;    // BOOT button, active low.
 
 constexpr int kPinEpdDb0 = 6;
 constexpr int kPinEpdDb1 = 14;
@@ -111,7 +112,7 @@ constexpr uint8_t kCardDetectPin = 5;
 constexpr uint16_t kButtonMask = 0x001F;
 constexpr uint16_t kCardMask = 1U << kCardDetectPin;
 constexpr uint16_t kUsedInputMask = kButtonMask | kCardMask;
-constexpr size_t kButtonCount = 6;  // BTN0..BTN4 plus the direct KEY7.
+constexpr size_t kButtonCount = 6;  // BTN0..BTN4 plus the direct BOOT button.
 constexpr size_t kMaxWifiNetworks = 12;
 
 constexpr int kCenterX = 56;
@@ -140,14 +141,14 @@ struct ButtonVisual {
   uint8_t logical_index;
 };
 
-// Visual order follows 2.png: BTN2/BTN4, BTN1/BTN3, BTN0/KEY7.
+// Visual order follows 2.png: BTN2/BTN4, BTN1/BTN3, BTN0/BOOT.
 constexpr std::array<ButtonVisual, kButtonCount> kButtonVisuals = {{
     {0, 244, "BTN2", 2},
     {493, 244, "BTN4", 4},
     {0, 356, "BTN1", 1},
     {493, 356, "BTN3", 3},
     {0, 626, "BTN0", 0},
-    {493, 626, "KEY7", 5},
+    {493, 626, "BOOT", 5},
 }};
 constexpr int kButtonW = 47;
 constexpr int kButtonH = 58;
@@ -781,14 +782,10 @@ InputState readInput()
     port = io_expander.digitalReadPort() & kUsedInputMask;
   }
   state.port = port;
-  bool any_expander_button = false;
   for (size_t index = 0; index < 5; ++index) {
     state.buttons[index] = (port & (1U << index)) == 0;
-    any_expander_button |= state.buttons[index];
   }
-  // Reading the XL9555 port releases its INT#. A remaining low level is KEY7.
-  delayMicroseconds(80);
-  state.buttons[5] = digitalRead(board::kPinExtIrq) == LOW && !any_expander_button;
+  state.buttons[5] = digitalRead(board::kPinBoot) == LOW;
   state.card_inserted = io_ready && ((port & kCardMask) == 0);
   return state;
 }
@@ -1058,6 +1055,7 @@ void setup()
 
   Serial.println("\n========== LILYGO FACTORY TEST ==========");
   pinMode(board::kPinExtIrq, INPUT_PULLUP);
+  pinMode(board::kPinBoot, INPUT_PULLUP);
 
   if (!display.init()) {
     Serial.println("[EPD] init failed");
