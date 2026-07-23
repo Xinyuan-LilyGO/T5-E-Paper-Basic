@@ -702,12 +702,14 @@ void drawSideButton(size_t visual_index)
 {
   const ButtonVisual& visual = kButtonVisuals[visual_index];
   const bool pressed = stable_input.buttons[visual.logical_index];
-  const uint32_t background = pressed ? TFT_BLACK : TFT_WHITE;
-  const uint32_t foreground = pressed ? TFT_WHITE : TFT_BLACK;
-  display.fillRoundRect(visual.x, visual.y, kButtonW, kButtonH, 8, background);
+  display.fillRoundRect(visual.x, visual.y, kButtonW, kButtonH, 8, TFT_WHITE);
   display.drawRoundRect(visual.x, visual.y, kButtonW, kButtonH, 8, TFT_BLACK);
+  if (pressed) {
+    display.drawRoundRect(visual.x + 2, visual.y + 2,
+                          kButtonW - 4, kButtonH - 4, 6, TFT_BLACK);
+  }
   display.setTextDatum(textdatum_t::middle_center);
-  display.setTextColor(foreground, background);
+  display.setTextColor(TFT_BLACK, TFT_WHITE);
   display.setFont(&fonts::Font2);
   display.drawString(visual.label, visual.x + kButtonW / 2, visual.y + kButtonH / 2 - 7);
   display.setFont(&fonts::Font0);
