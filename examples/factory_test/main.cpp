@@ -106,7 +106,7 @@ constexpr char kWifiSsid2[] = "xinyuandianzi";
 constexpr char kWifiPassword2[] = "AA15994823428";
 
 constexpr uint32_t kSplashHoldMs = 3000;
-constexpr uint32_t kDebounceMs = 25;
+constexpr uint32_t kDebounceMs = 12;
 constexpr uint32_t kWifiConnectTimeoutMs = 12000;
 constexpr uint8_t kCardDetectPin = 5;
 constexpr uint16_t kButtonMask = 0x001F;
@@ -1015,7 +1015,7 @@ void handleStableInput(const InputState& previous)
                   stable_input.buttons[logical_index] ? "DOWN" : "UP");
     drawSideButton(visual_index);
     refreshLogicalRect(kButtonVisuals[visual_index].x, kButtonVisuals[visual_index].y,
-                       kButtonW, kButtonH, lgfx::epd_text);
+                       kButtonW, kButtonH, lgfx::epd_fastest);
   }
 
   if (previous.card_inserted != stable_input.card_inserted) {
@@ -1103,5 +1103,5 @@ void loop()
 {
   pollInputs();
   pollWifi();
-  delay(15);
+  delay(5);
 }
