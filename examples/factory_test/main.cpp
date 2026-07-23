@@ -143,12 +143,12 @@ struct ButtonVisual {
 
 // Visual order follows 2.png: BTN2/BTN4, BTN1/BTN3, BTN0/BOOT.
 constexpr std::array<ButtonVisual, kButtonCount> kButtonVisuals = {{
-    {0, 244, "BTN2", 2},
-    {493, 244, "BTN4", 4},
-    {0, 356, "BTN1", 1},
-    {493, 356, "BTN3", 3},
-    {0, 626, "BTN0", 0},
-    {493, 626, "BOOT", 5},
+    {0, 415, "BTN2", 2},
+    {493, 415, "BTN4", 4},
+    {0, 650, "BTN1", 1},
+    {493, 650, "BTN3", 3},
+    {0, 885, "BTN0", 0},
+    {493, 885, "BOOT", 5},
 }};
 constexpr int kButtonW = 47;
 constexpr int kButtonH = 58;
@@ -705,8 +705,8 @@ void drawSideButton(size_t visual_index)
   display.fillRoundRect(visual.x, visual.y, kButtonW, kButtonH, 8, TFT_WHITE);
   display.drawRoundRect(visual.x, visual.y, kButtonW, kButtonH, 8, TFT_BLACK);
   if (pressed) {
-    display.drawRoundRect(visual.x + 2, visual.y + 2,
-                          kButtonW - 4, kButtonH - 4, 6, TFT_BLACK);
+    display.drawRoundRect(visual.x + 3, visual.y + 3,
+                          kButtonW - 6, kButtonH - 6, 6, TFT_BLACK);
   }
   display.setTextDatum(textdatum_t::middle_center);
   display.setTextColor(TFT_BLACK, TFT_WHITE);
@@ -717,24 +717,10 @@ void drawSideButton(size_t visual_index)
                      visual.y + kButtonH / 2 + 12);
 }
 
-void drawButtonConnectors()
-{
-  for (const ButtonVisual& visual : kButtonVisuals) {
-    const int mid_y = visual.y + kButtonH / 2;
-    if (visual.x == 0) {
-      display.drawFastHLine(kButtonW, mid_y, kCenterX - kButtonW, TFT_BLACK);
-    } else {
-      display.drawFastHLine(kCenterX + kCenterW, mid_y,
-                            visual.x - (kCenterX + kCenterW), TFT_BLACK);
-    }
-  }
-}
-
 void drawMainScreen()
 {
   display.fillScreen(TFT_WHITE);
   drawCornerMarks();
-  drawButtonConnectors();
   drawMainHeader();
   drawSdCard();
   drawWifiCard();
