@@ -9,6 +9,7 @@
 #include <cstring>
 #include <utility>
 
+#include <GaugeAXP2602.hpp>
 #include <IoExpanderXL9555.hpp>
 #include <M5GFX.h>
 #include <lgfx/v1/platforms/esp32/Bus_EPD.h>
@@ -19,6 +20,7 @@ namespace board
 constexpr int kPinI2cSda = 3;
 constexpr int kPinI2cScl = 2;
 constexpr int kPinExtIrq = 1;  // XL9555 active-low interrupt.
+constexpr int kPinAxp2602Irq = 21;
 constexpr int kPinBoot = 0;    // BOOT button, active low.
 
 constexpr int kPinEpdDb0 = 6;
@@ -108,6 +110,15 @@ constexpr char kWifiPassword2[] = "AA15994823428";
 constexpr uint32_t kSplashHoldMs = 3000;
 constexpr uint32_t kDebounceMs = 12;
 constexpr uint32_t kWifiConnectTimeoutMs = 12000;
+constexpr uint32_t kBootLongPressMs = 2000;
+constexpr uint32_t kBootDebounceUs = kDebounceMs * 1000U;
+constexpr uint32_t kBootLongPressUs = kBootLongPressMs * 1000U;
+constexpr uint32_t kGaugeSampleIntervalMs = 1000;
+constexpr uint32_t kGaugeUiIntervalMs = 10000;
+constexpr uint32_t kGaugeRetryIntervalMs = 5000;
+constexpr uint8_t kAxp2602Address = 0x62;
+constexpr uint8_t kAxp2602ChipId = 0x1C;
+constexpr float kGaugeIdleCurrentMa = 1.0f;
 constexpr uint8_t kCardDetectPin = 5;
 constexpr uint16_t kButtonMask = 0x001F;
 constexpr uint16_t kCardMask = 1U << kCardDetectPin;
@@ -152,11 +163,17 @@ constexpr std::array<ButtonVisual, kButtonCount> kButtonVisuals = {{
 }};
 constexpr int kButtonW = 47;
 constexpr int kButtonH = 58;
+constexpr int kButtonRefreshMargin = 4;
 
 struct InputState {
   uint16_t port = kUsedInputMask;
   std::array<bool, kButtonCount> buttons = {};
   bool card_inserted = false;
+};
+
+struct BootEdge {
+  uint32_t at_us;
+  bool pressed;
 };
 
 enum class SdState : uint8_t {
@@ -176,6 +193,18 @@ struct SdResult {
   uint16_t file_count = 0;
   uint16_t directory_count = 0;
   bool read_write_ok = false;
+};
+
+struct GaugeInfo {
+  bool valid = false;
+  bool sleeping = false;
+  int chip_id = -1;
+  uint16_t battery_mv = 0;
+  float current_ma = 0.0f;
+  uint8_t soc = 0;
+  uint8_t soh = 0;
+  int8_t battery_temperature_c = 0;
+  float die_temperature_c = 0.0f;
 };
 
 enum class WifiState : uint8_t {
@@ -206,14 +235,34 @@ constexpr std::array<WifiTarget, 2> kWifiTargets = {{
 
 LilyGoEPaperBasicDisplay display;
 IoExpanderXL9555 io_expander;
+GaugeAXP2602 gauge;
 
 bool io_ready = false;
 bool screen_ready = false;
 bool sd_bus_ready = false;
+bool gauge_ready = false;
 InputState stable_input;
 InputState sampled_input;
 uint32_t sampled_change_ms = 0;
 SdResult sd_result;
+GaugeInfo gauge_info;
+
+constexpr uint8_t kBootEdgeQueueSize = 64;
+constexpr uint8_t kBootEdgeQueueMask = kBootEdgeQueueSize - 1;
+volatile BootEdge boot_edge_queue[kBootEdgeQueueSize] = {};
+volatile uint8_t boot_edge_read_index = 0;
+volatile uint8_t boot_edge_write_index = 0;
+volatile bool boot_edge_overflow = false;
+bool boot_stable_pressed = false;
+bool boot_candidate_pressed = false;
+bool boot_gesture_armed = true;
+uint32_t boot_candidate_since_us = 0;
+uint32_t boot_pressed_us = 0;
+bool boot_press_active = false;
+bool boot_long_action_done = false;
+uint32_t last_gauge_sample_ms = 0;
+uint32_t last_gauge_ui_ms = 0;
+uint32_t last_gauge_retry_ms = 0;
 
 WifiState wifi_state = WifiState::kScanning;
 std::array<WifiNetwork, kMaxWifiNetworks> wifi_networks;
@@ -225,6 +274,22 @@ uint32_t wifi_connect_started_ms = 0;
 String connected_ssid;
 String connected_ip;
 int32_t connected_rssi = -127;
+
+void ARDUINO_ISR_ATTR onBootEdge()
+{
+  const uint8_t write_index = boot_edge_write_index;
+  const uint8_t next_index =
+      (write_index + 1U) & kBootEdgeQueueMask;
+  if (next_index == boot_edge_read_index) {
+    boot_edge_overflow = true;
+    return;
+  }
+
+  boot_edge_queue[write_index].at_us = micros();
+  boot_edge_queue[write_index].pressed =
+      digitalRead(board::kPinBoot) == LOW;
+  boot_edge_write_index = next_index;
+}
 
 uint32_t gray(uint8_t value)
 {
@@ -447,15 +512,63 @@ void drawStatusBadge(int x, int y, int w, const String& text, bool dark,
   display.setTextColor(foreground, background);
   if (ascii_text) {
     display.setFont(&fonts::Font2);
+    display.setTextSize(1);
   } else {
     setUiFont(1, true);
   }
   display.drawString(text, x + w / 2, y + 15);
 }
 
+const char* gaugeBadgeText()
+{
+  if (!gauge_ready) return "NOT FOUND";
+  if (gauge_info.sleeping) return "SLEEP";
+  return gauge_info.valid ? "READY" : "NO DATA";
+}
+
+const char* gaugeStateText()
+{
+  if (!gauge_ready || !gauge_info.valid) return "WAITING";
+  if (gauge_info.sleeping) return "DATA HOLD";
+  if (gauge_info.current_ma > kGaugeIdleCurrentMa) return "CHARGING";
+  if (gauge_info.current_ma < -kGaugeIdleCurrentMa) return "DISCHARGING";
+  return "IDLE";
+}
+
+String gaugeVoltageText()
+{
+  if (!gauge_info.valid) return "--";
+  return String(gauge_info.battery_mv / 1000.0f, 3) + " V";
+}
+
+String gaugeCurrentText()
+{
+  if (!gauge_info.valid) return "--";
+  String text;
+  if (gauge_info.current_ma > 0.0f) text += "+";
+  text += String(gauge_info.current_ma, 1);
+  text += " mA";
+  return text;
+}
+
+void drawGaugeBattery(int x, int y, int w, int h)
+{
+  display.fillRect(x, y, w + 7, h, TFT_WHITE);
+  display.drawRoundRect(x, y, w, h, 5, TFT_BLACK);
+  display.fillRect(x + w, y + h / 3, 7, h / 3, TFT_BLACK);
+  if (!gauge_info.valid) return;
+
+  const int inner_w = w - 8;
+  const int fill_w =
+      inner_w * std::min<uint8_t>(gauge_info.soc, 100) / 100;
+  if (fill_w > 0) {
+    display.fillRect(x + 4, y + 4, fill_w, h - 8, TFT_BLACK);
+  }
+}
+
 void drawMainHeader()
 {
-  display.fillRoundRect(kCenterX, kHeaderY, kCenterW, kHeaderH, 16, gray(242));
+  display.fillRoundRect(kCenterX, kHeaderY, kCenterW, kHeaderH, 16, TFT_WHITE);
   display.drawRoundRect(kCenterX, kHeaderY, kCenterW, kHeaderH, 16, TFT_BLACK);
   display.fillRoundRect(kCenterX, kHeaderY, kCenterW, 70, 16, TFT_BLACK);
   display.fillRect(kCenterX, kHeaderY + 54, kCenterW, 16, TFT_BLACK);
@@ -465,21 +578,55 @@ void drawMainHeader()
   setUiFont(2, true);
   display.drawString("出厂测试", kCenterX + kCenterW / 2, kHeaderY + 9);
   display.setFont(&fonts::Font2);
+  display.setTextSize(1);
   display.setTextDatum(textdatum_t::top_left);
   display.drawString("T5 E-PAPER BASIC", kCenterX + 18, kHeaderY + 49);
   display.setTextDatum(textdatum_t::top_right);
-  display.drawString("FACTORY DIAGNOSTICS", kCenterX + kCenterW - 18, kHeaderY + 49);
+  display.drawString(String("EPD PASS | IO ") + (io_ready ? "PASS" : "CHECK"),
+                     kCenterX + kCenterW - 18, kHeaderY + 49);
 
-  display.setTextColor(TFT_BLACK, gray(242));
-  setUiFont(1);
-  display.setTextDatum(textdatum_t::top_left);
-  display.drawString("屏幕", kCenterX + 18, kHeaderY + 86);
-  display.drawString("按键 / IO", kCenterX + 146, kHeaderY + 86);
-  display.drawString("分辨率", kCenterX + 292, kHeaderY + 86);
+  constexpr int kFirstDividerX = kCenterX + 140;
+  constexpr int kSecondDividerX = kCenterX + 288;
+  display.drawFastVLine(kFirstDividerX, kHeaderY + 82, 62, TFT_BLACK);
+  display.drawFastVLine(kSecondDividerX, kHeaderY + 82, 62, TFT_BLACK);
+
+  display.setTextColor(TFT_BLACK, TFT_WHITE);
   display.setFont(&fonts::Font2);
-  display.drawString("PASS", kCenterX + 18, kHeaderY + 118);
-  display.drawString(io_ready ? "PASS" : "CHECK", kCenterX + 146, kHeaderY + 118);
-  display.drawString("540 x 960", kCenterX + 292, kHeaderY + 118);
+  display.setTextDatum(textdatum_t::top_left);
+  display.drawString("AXP2602", kCenterX + 16, kHeaderY + 78);
+  drawStatusBadge(kCenterX + 16, kHeaderY + 100, 106, gaugeBadgeText(),
+                  gauge_ready && gauge_info.valid, true);
+  display.setTextDatum(textdatum_t::top_left);
+  display.setTextColor(TFT_BLACK, TFT_WHITE);
+  display.setFont(&fonts::Font0);
+  const String chip_id =
+      gauge_info.chip_id >= 0 ? String(gauge_info.chip_id, HEX) : "--";
+  display.drawString(String("ID 0x") + chip_id + "  |  IRQ21",
+                     kCenterX + 16, kHeaderY + 135);
+
+  display.setFont(&fonts::Font0);
+  display.drawString("VBAT", kCenterX + 156, kHeaderY + 78);
+  display.setFont(&fonts::Font2);
+  display.drawString(gaugeVoltageText(), kCenterX + 156, kHeaderY + 89);
+  display.setFont(&fonts::Font0);
+  display.drawString("IBAT  (+CHG / -DSG)", kCenterX + 156, kHeaderY + 113);
+  display.setFont(&fonts::Font2);
+  display.drawString(gaugeCurrentText(), kCenterX + 156, kHeaderY + 124);
+
+  drawGaugeBattery(kCenterX + 304, kHeaderY + 80, 55, 24);
+  display.setFont(&fonts::Font2);
+  display.setTextDatum(textdatum_t::top_left);
+  display.drawString(gauge_info.valid ? String(gauge_info.soc) + "%" : "--",
+                     kCenterX + 374, kHeaderY + 83);
+  display.setTextDatum(textdatum_t::top_center);
+  display.drawString(gaugeStateText(), kCenterX + 358, kHeaderY + 110);
+  display.setFont(&fonts::Font0);
+  const String health_temperature =
+      gauge_info.valid
+          ? String("SOH ") + gauge_info.soh + "%  |  T "
+                + String(gauge_info.die_temperature_c, 1) + "C"
+          : "SOH --  |  T --";
+  display.drawString(health_temperature, kCenterX + 358, kHeaderY + 136);
 }
 
 const char* sdCardTypeName(uint8_t type)
@@ -731,9 +878,11 @@ void drawMainScreen()
   display.setTextDatum(textdatum_t::middle_center);
   display.setTextColor(TFT_BLACK, TFT_WHITE);
   setUiFont(1);
-  display.drawString("按下侧键检查输入 · 黑色表示按下", display.width() / 2, 910);
+  display.drawString("BOOT：长按 2 秒休眠电量计 · 休眠时短按唤醒",
+                     display.width() / 2, 910);
   display.setFont(&fonts::Font2);
-  display.drawString("LILYGO FACTORY TEST  |  EPD / SD / WIFI / KEYS", display.width() / 2, 940);
+  display.drawString("LILYGO FACTORY TEST  |  EPD / SD / WIFI / KEYS / AXP2602",
+                     display.width() / 2, 940);
 }
 
 void refreshMainFull()
@@ -748,6 +897,15 @@ void refreshSdCard()
 {
   drawSdCard();
   refreshLogicalRect(kCenterX, kSdY, kCenterW, kSdH, lgfx::epd_text);
+}
+
+void refreshMainHeader()
+{
+  drawMainHeader();
+  constexpr int kStaticHeaderH = 70;
+  refreshLogicalRect(kCenterX, kHeaderY + kStaticHeaderH, kCenterW,
+                     kHeaderH - kStaticHeaderH, lgfx::epd_text);
+  last_gauge_ui_ms = millis();
 }
 
 void refreshWifiCard()
@@ -992,6 +1150,269 @@ void pollWifi()
   }
 }
 
+void configureGauge()
+{
+  gauge.setOperatingMode(GaugeAXP2602::OPERATING_MODE_NORMAL);
+  gauge.setCurrentSenseResistor(GaugeAXP2602::SENSE_RESISTOR_10_MOHM);
+  gauge.setBatteryDetection(true);
+  gauge.setCurrentMeasurement(true);
+  gauge.setThermalDieMeasurement(true);
+}
+
+bool gaugeResponds()
+{
+  Wire.beginTransmission(kAxp2602Address);
+  return Wire.endTransmission() == 0;
+}
+
+bool initializeGauge()
+{
+  if (!gauge.begin(Wire, board::kPinI2cSda, board::kPinI2cScl)) {
+    gauge_ready = false;
+    gauge_info.valid = false;
+    gauge_info.sleeping = false;
+    gauge_info.chip_id = -1;
+    Serial.printf("[AXP2602] not found at I2C address 0x%02X\n",
+                  kAxp2602Address);
+    return false;
+  }
+
+  Wire.setClock(400000);
+  configureGauge();
+  gauge_ready = true;
+  gauge_info.sleeping = gauge.isSleepModeEnabled();
+  gauge_info.chip_id = gauge.getChipID();
+  Serial.printf("[AXP2602] ready: ID=0x%02X, SDA=%d, SCL=%d, IRQ=%d\n",
+                gauge_info.chip_id, board::kPinI2cSda, board::kPinI2cScl,
+                board::kPinAxp2602Irq);
+  return true;
+}
+
+bool sampleGauge()
+{
+  if (!gauge_ready || gauge_info.sleeping) return false;
+
+  if (!gauge.refresh()) {
+    gauge_ready = false;
+    gauge_info.valid = false;
+    last_gauge_retry_ms = millis();
+    Serial.println("[AXP2602] refresh failed; waiting to retry");
+    return false;
+  }
+
+  gauge_info.chip_id = gauge.getChipID();
+  gauge_info.valid = gauge_info.chip_id == kAxp2602ChipId;
+  if (!gauge_info.valid) {
+    gauge_ready = false;
+    last_gauge_retry_ms = millis();
+    Serial.printf("[AXP2602] invalid chip ID: 0x%02X\n", gauge_info.chip_id);
+    return false;
+  }
+
+  gauge_info.battery_mv = gauge.getVoltage();
+  gauge_info.current_ma = gauge.getCurrent();
+  gauge_info.soc = gauge.getStateOfCharge();
+  gauge_info.soh = gauge.getBatteryStatus();
+  gauge_info.battery_temperature_c = gauge.getTemperature();
+  gauge_info.die_temperature_c = gauge.getThermalDieTemperature();
+
+  Serial.printf(
+      "[AXP2602] %s, VBAT=%u mV, IBAT=%+.1f mA, SOC=%u%%, SOH=%u%%, "
+      "TBAT=%d C, TDIE=%.1f C\n",
+      gaugeStateText(), gauge_info.battery_mv, gauge_info.current_ma,
+      gauge_info.soc, gauge_info.soh, gauge_info.battery_temperature_c,
+      gauge_info.die_temperature_c);
+  return true;
+}
+
+void setGaugeSleep(bool sleep)
+{
+  if (!gauge_ready) return;
+
+  if (sleep) {
+    gauge.sleep();
+    gauge_info.sleeping = gauge.isSleepModeEnabled();
+    if (gauge_info.sleeping) {
+      Serial.println(
+          "[AXP2602] fuel gauge sleeping; measurements are frozen, system remains on");
+    } else {
+      Serial.println("[AXP2602] failed to enter fuel-gauge sleep");
+    }
+  } else {
+    gauge.wakeup();
+    delay(20);
+    gauge_info.sleeping = gauge.isSleepModeEnabled();
+    if (!gauge_info.sleeping) {
+      configureGauge();
+      if (sampleGauge()) {
+        Serial.println("[AXP2602] fuel gauge awake and sampled");
+      } else {
+        Serial.println("[AXP2602] wake succeeded, but data refresh failed");
+      }
+    } else {
+      Serial.println("[AXP2602] failed to wake fuel gauge");
+    }
+  }
+
+  refreshMainHeader();
+}
+
+void beginBootGestureCapture()
+{
+  const bool pressed = digitalRead(board::kPinBoot) == LOW;
+  noInterrupts();
+  boot_edge_read_index = 0;
+  boot_edge_write_index = 0;
+  boot_edge_overflow = false;
+  interrupts();
+
+  boot_stable_pressed = pressed;
+  boot_candidate_pressed = pressed;
+  boot_candidate_since_us = micros();
+  boot_gesture_armed = !pressed;
+  boot_press_active = false;
+  boot_long_action_done = false;
+  attachInterrupt(digitalPinToInterrupt(board::kPinBoot), onBootEdge, CHANGE);
+}
+
+bool popBootEdge(BootEdge& edge)
+{
+  noInterrupts();
+  const uint8_t read_index = boot_edge_read_index;
+  if (read_index == boot_edge_write_index) {
+    interrupts();
+    return false;
+  }
+  edge.at_us = boot_edge_queue[read_index].at_us;
+  edge.pressed = boot_edge_queue[read_index].pressed;
+  boot_edge_read_index = (read_index + 1U) & kBootEdgeQueueMask;
+  interrupts();
+  return true;
+}
+
+bool recoverBootEdgeOverflow()
+{
+  noInterrupts();
+  const bool overflowed = boot_edge_overflow;
+  if (overflowed) {
+    boot_edge_read_index = boot_edge_write_index;
+    boot_edge_overflow = false;
+  }
+  interrupts();
+  if (!overflowed) return false;
+
+  const bool pressed = digitalRead(board::kPinBoot) == LOW;
+  boot_stable_pressed = pressed;
+  boot_candidate_pressed = pressed;
+  boot_candidate_since_us = micros();
+  boot_gesture_armed = !pressed;
+  boot_press_active = false;
+  boot_long_action_done = false;
+  Serial.println("[BOOT] edge queue overflow; gesture state resynchronized");
+  return true;
+}
+
+void commitBootStableState(bool pressed, uint32_t at_us)
+{
+  if (pressed == boot_stable_pressed) return;
+  boot_stable_pressed = pressed;
+
+  if (pressed) {
+    if (!boot_gesture_armed) return;
+    boot_pressed_us = at_us;
+    boot_press_active = true;
+    boot_long_action_done = false;
+    return;
+  }
+
+  if (!boot_gesture_armed) {
+    boot_gesture_armed = true;
+    boot_press_active = false;
+    boot_long_action_done = false;
+    return;
+  }
+  if (!boot_press_active) return;
+
+  const uint32_t held_us = at_us - boot_pressed_us;
+  if (!boot_long_action_done && held_us >= kBootLongPressUs) {
+    boot_long_action_done = true;
+    if (gauge_ready && !gauge_info.sleeping) {
+      setGaugeSleep(true);
+    }
+  } else if (!boot_long_action_done
+             && gauge_ready && gauge_info.sleeping) {
+    setGaugeSleep(false);
+  }
+  boot_press_active = false;
+}
+
+void commitBootCandidateIfStable(uint32_t until_us)
+{
+  if (boot_candidate_pressed == boot_stable_pressed
+      || until_us - boot_candidate_since_us < kBootDebounceUs) {
+    return;
+  }
+  commitBootStableState(
+      boot_candidate_pressed, boot_candidate_since_us + kBootDebounceUs);
+}
+
+void processBootEdges()
+{
+  if (recoverBootEdgeOverflow()) return;
+
+  BootEdge edge = {};
+  while (popBootEdge(edge)) {
+    if (edge.pressed == boot_candidate_pressed) continue;
+    commitBootCandidateIfStable(edge.at_us);
+    boot_candidate_pressed = edge.pressed;
+    boot_candidate_since_us = edge.at_us;
+  }
+  commitBootCandidateIfStable(micros());
+}
+
+void handleBootLongPress()
+{
+  if (!boot_press_active || !boot_stable_pressed
+      || boot_long_action_done
+      || micros() - boot_pressed_us < kBootLongPressUs) {
+    return;
+  }
+
+  boot_long_action_done = true;
+  if (gauge_ready && !gauge_info.sleeping) {
+    setGaugeSleep(true);
+  }
+}
+
+void pollGauge()
+{
+  const uint32_t now = millis();
+  if (!gauge_ready) {
+    if (now - last_gauge_retry_ms < kGaugeRetryIntervalMs) return;
+
+    last_gauge_retry_ms = now;
+    if (gaugeResponds() && initializeGauge()) {
+      sampleGauge();
+      refreshMainHeader();
+    }
+    return;
+  }
+
+  if (gauge_info.sleeping
+      || now - last_gauge_sample_ms < kGaugeSampleIntervalMs) {
+    return;
+  }
+
+  last_gauge_sample_ms = now;
+  const bool old_valid = gauge_info.valid;
+  sampleGauge();
+
+  if (old_valid != gauge_info.valid
+      || now - last_gauge_ui_ms >= kGaugeUiIntervalMs) {
+    refreshMainHeader();
+  }
+}
+
 void handleStableInput(const InputState& previous)
 {
   for (size_t visual_index = 0; visual_index < kButtonVisuals.size(); ++visual_index) {
@@ -1002,8 +1423,18 @@ void handleStableInput(const InputState& previous)
     Serial.printf("[KEY] %s -> %s\n", kButtonVisuals[visual_index].label,
                   stable_input.buttons[logical_index] ? "DOWN" : "UP");
     drawSideButton(visual_index);
-    refreshLogicalRect(kButtonVisuals[visual_index].x, kButtonVisuals[visual_index].y,
-                       kButtonW, kButtonH, lgfx::epd_fastest);
+    const ButtonVisual& visual = kButtonVisuals[visual_index];
+    const int refresh_x = std::max(0, visual.x - kButtonRefreshMargin);
+    const int refresh_y = std::max(0, visual.y - kButtonRefreshMargin);
+    const int refresh_right =
+        std::min(display.width(), visual.x + kButtonW + kButtonRefreshMargin);
+    const int refresh_bottom =
+        std::min(display.height(), visual.y + kButtonH + kButtonRefreshMargin);
+    refreshLogicalRect(refresh_x, refresh_y, refresh_right - refresh_x,
+                       refresh_bottom - refresh_y,
+                       stable_input.buttons[logical_index]
+                           ? lgfx::epd_fastest
+                           : lgfx::epd_fastest);
   }
 
   if (previous.card_inserted != stable_input.card_inserted) {
@@ -1043,6 +1474,7 @@ void setup()
 
   Serial.println("\n========== LILYGO FACTORY TEST ==========");
   pinMode(board::kPinExtIrq, INPUT_PULLUP);
+  pinMode(board::kPinAxp2602Irq, INPUT_PULLUP);
   pinMode(board::kPinBoot, INPUT_PULLUP);
 
   if (!display.init()) {
@@ -1062,14 +1494,18 @@ void setup()
   Serial.println("[EPD] startup pattern visible for 3 seconds");
   delay(kSplashHoldMs);
 
+  initializeGauge();
   io_ready = io_expander.begin(Wire, XL9555_SLAVE_ADDRESS0,
                                board::kPinI2cSda, board::kPinI2cScl);
   if (io_ready) {
-    Wire.setClock(400000);
     io_expander.configPins(kUsedInputMask, INPUT);
     Serial.println("[IO] XL9555 ready");
   } else {
     Serial.println("[IO] XL9555 not found");
+  }
+  Wire.setClock(400000);
+  if (gauge_ready) {
+    sampleGauge();
   }
 
   stable_input = readInput();
@@ -1085,11 +1521,20 @@ void setup()
   if (wifi_state == WifiState::kScanFailed) {
     refreshWifiCard();
   }
+
+  const uint32_t now = millis();
+  last_gauge_sample_ms = now;
+  last_gauge_ui_ms = now;
+  last_gauge_retry_ms = now;
+  beginBootGestureCapture();
 }
 
 void loop()
 {
   pollInputs();
+  processBootEdges();
+  handleBootLongPress();
+  pollGauge();
   pollWifi();
   delay(5);
 }
