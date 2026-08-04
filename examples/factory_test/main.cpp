@@ -15,6 +15,12 @@
 #include <lgfx/v1/platforms/esp32/Bus_EPD.h>
 #include <lgfx/v1/platforms/esp32/Panel_EPD.hpp>
 
+// Set to 1 (or add -DFACTORY_TEST_PANEL_1216X684=1 to build_flags) for
+// the 1216 x 684 panel. The default panel resolution is 960 x 540.
+#ifndef FACTORY_TEST_PANEL_1216X684
+#define FACTORY_TEST_PANEL_1216X684 0
+#endif
+
 namespace board
 {
 constexpr int kPinI2cSda = 3;
@@ -45,10 +51,63 @@ constexpr int kPinSdMiso = 40;
 constexpr int kPinSdCs = 47;
 constexpr uint32_t kSdSpiClock = 16000000;
 
+#if FACTORY_TEST_PANEL_1216X684
+constexpr int kPanelWidth = 1216;
+constexpr int kPanelHeight = 684;
+constexpr uint32_t kEpdBusSpeed = 20000000;  // 50 ns typical XCL cycle.
+constexpr uint8_t kPanelLinePadding = 10;    // Required trailing dummy clocks.
+#else
 constexpr int kPanelWidth = 960;
 constexpr int kPanelHeight = 540;
+constexpr uint32_t kEpdBusSpeed = 16000000;
+constexpr uint8_t kPanelLinePadding = 8;
+#endif
 constexpr uint8_t kPanelOffsetRotation = 3;
 }  // namespace board
+
+class LilyGoEPaperBus : public lgfx::Bus_EPD
+{
+ public:
+  void scanlineDone() override
+  {
+#if FACTORY_TEST_PANEL_1216X684
+    // E0470A03-AF-S requires CKV low and XLE high for at least 1 us.
+    wait();
+    delayMicroseconds(1);
+#endif
+  }
+
+  bool powerControl(bool power_on) override
+  {
+#if FACTORY_TEST_PANEL_1216X684
+    if (_pwr_on == power_on) {
+      return true;
+    }
+
+    wait();
+    _pwr_on = power_on;
+    if (power_on) {
+      // Keep source outputs disabled until the high-voltage rails settle.
+      digitalWrite(_config.pin_oe, LOW);
+      digitalWrite(_config.pin_spv, HIGH);
+      digitalWrite(_config.pin_pwr, HIGH);
+      delay(1);
+      digitalWrite(_config.pin_oe, HIGH);
+    } else {
+      // Datasheet section 6.1 requires at least 12 us from OE low to
+      // VPOS/VNEG power-off.
+      digitalWrite(_config.pin_oe, LOW);
+      delayMicroseconds(12);
+      digitalWrite(_config.pin_pwr, LOW);
+      delayMicroseconds(100);
+      digitalWrite(_config.pin_spv, LOW);
+    }
+    return true;
+#else
+    return lgfx::Bus_EPD::powerControl(power_on);
+#endif
+  }
+};
 
 class LilyGoEPaperBasicDisplay : public lgfx::LGFX_Device
 {
@@ -56,7 +115,7 @@ class LilyGoEPaperBasicDisplay : public lgfx::LGFX_Device
   LilyGoEPaperBasicDisplay()
   {
     auto bus_cfg = bus_.config();
-    bus_cfg.bus_speed = 16000000;
+    bus_cfg.bus_speed = board::kEpdBusSpeed;
     bus_cfg.pin_data[0] = board::kPinEpdDb0;
     bus_cfg.pin_data[1] = board::kPinEpdDb1;
     bus_cfg.pin_data[2] = board::kPinEpdDb2;
@@ -78,7 +137,7 @@ class LilyGoEPaperBasicDisplay : public lgfx::LGFX_Device
     panel_.setBus(&bus_);
 
     auto detail_cfg = panel_.config_detail();
-    detail_cfg.line_padding = 8;
+    detail_cfg.line_padding = board::kPanelLinePadding;
     panel_.config_detail(detail_cfg);
 
     auto panel_cfg = panel_.config();
@@ -96,7 +155,7 @@ class LilyGoEPaperBasicDisplay : public lgfx::LGFX_Device
   }
 
  private:
-  lgfx::Bus_EPD bus_;
+  LilyGoEPaperBus bus_;
   lgfx::Panel_EPD panel_;
 };
 
@@ -126,14 +185,23 @@ constexpr uint16_t kUsedInputMask = kButtonMask | kCardMask;
 constexpr size_t kButtonCount = 6;  // BTN0..BTN4 plus the direct BOOT button.
 constexpr size_t kMaxWifiNetworks = 12;
 
-constexpr int kCenterX = 56;
-constexpr int kCenterW = 428;
-constexpr int kHeaderY = 18;
-constexpr int kHeaderH = 154;
-constexpr int kSdY = 194;
-constexpr int kSdH = 252;
-constexpr int kWifiY = 468;
-constexpr int kWifiH = 416;
+constexpr int kUiBaseWidth = 540;
+constexpr float kUiScale =
+    static_cast<float>(board::kPanelHeight) / kUiBaseWidth;
+
+constexpr int uiPx(int value)
+{
+  return (value * board::kPanelHeight + kUiBaseWidth / 2) / kUiBaseWidth;
+}
+
+constexpr int kCenterX = uiPx(56);
+constexpr int kCenterW = uiPx(428);
+constexpr int kHeaderY = uiPx(18);
+constexpr int kHeaderH = uiPx(154);
+constexpr int kSdY = uiPx(194);
+constexpr int kSdH = uiPx(252);
+constexpr int kWifiY = uiPx(468);
+constexpr int kWifiH = uiPx(416);
 
 constexpr char kSdTestPath[] = "/.lilygo_factory_test.tmp";
 constexpr char kSdTestPayload[] = "LILYGO T5 E-Paper Basic factory test\n";
@@ -154,16 +222,16 @@ struct ButtonVisual {
 
 // Visual order follows 2.png: BTN2/BTN4, BTN1/BTN3, BTN0/BOOT.
 constexpr std::array<ButtonVisual, kButtonCount> kButtonVisuals = {{
-    {0, 415, "BTN2", 2},
-    {493, 415, "BTN4", 4},
-    {0, 650, "BTN1", 1},
-    {493, 650, "BTN3", 3},
-    {0, 885, "BTN0", 0},
-    {493, 885, "BOOT", 5},
+    {0, uiPx(415), "BTN2", 2},
+    {uiPx(493), uiPx(415), "BTN4", 4},
+    {0, uiPx(650), "BTN1", 1},
+    {uiPx(493), uiPx(650), "BTN3", 3},
+    {0, uiPx(885), "BTN0", 0},
+    {uiPx(493), uiPx(885), "BOOT", 5},
 }};
-constexpr int kButtonW = 47;
-constexpr int kButtonH = 58;
-constexpr int kButtonRefreshMargin = 4;
+constexpr int kButtonW = uiPx(47);
+constexpr int kButtonH = uiPx(58);
+constexpr int kButtonRefreshMargin = uiPx(4);
 
 struct InputState {
   uint16_t port = kUsedInputMask;
@@ -299,7 +367,7 @@ uint32_t gray(uint8_t value)
 void setUiFont(uint8_t scale = 1, bool bold = false)
 {
   display.setFont(bold ? &fonts::efontCN_16_b : &fonts::efontCN_16);
-  display.setTextSize(scale);
+  display.setTextSize(scale * kUiScale);
 }
 
 String fitText(String text, int max_width)
@@ -372,7 +440,7 @@ void refreshLogicalRect(int x, int y, int w, int h,
 
 void drawCornerMarks()
 {
-  constexpr int kLength = 22;
+  constexpr int kLength = uiPx(22);
   display.drawFastHLine(0, 0, kLength, TFT_BLACK);
   display.drawFastVLine(0, 0, kLength, TFT_BLACK);
   display.drawFastHLine(display.width() - kLength, 0, kLength, TFT_BLACK);
@@ -389,30 +457,38 @@ void drawStartupPattern()
   display.fillScreen(TFT_WHITE);
   drawCornerMarks();
 
-  display.fillRoundRect(18, 18, width - 36, 126, 14, gray(232));
-  display.drawRoundRect(18, 18, width - 36, 126, 14, TFT_BLACK);
-  display.drawRoundRect(27, 27, width - 54, 108, 11, gray(150));
+  display.fillRoundRect(uiPx(18), uiPx(18), width - uiPx(36), uiPx(126),
+                        uiPx(14), gray(232));
+  display.drawRoundRect(uiPx(18), uiPx(18), width - uiPx(36), uiPx(126),
+                        uiPx(14), TFT_BLACK);
+  display.drawRoundRect(uiPx(27), uiPx(27), width - uiPx(54), uiPx(108),
+                        uiPx(11), gray(150));
   display.setTextDatum(textdatum_t::top_center);
   display.setTextColor(TFT_BLACK, gray(232));
   setUiFont(2, true);
-  display.drawString("屏幕测试", width / 2, 36);
+  display.drawString("屏幕测试", width / 2, uiPx(36));
   setUiFont(1);
-  display.drawString("DISPLAY TEST  |  540 x 960  |  16 GRAY", width / 2, 94);
+  const String resolution_text =
+      String("DISPLAY TEST  |  ") + display.width() + " x "
+      + display.height() + "  |  16 GRAY";
+  display.drawString(resolution_text, width / 2, uiPx(94));
 
-  display.fillRoundRect(18, 160, width - 36, 184, 12, gray(246));
-  display.drawRoundRect(18, 160, width - 36, 184, 12, TFT_BLACK);
+  display.fillRoundRect(uiPx(18), uiPx(160), width - uiPx(36), uiPx(184),
+                        uiPx(12), gray(246));
+  display.drawRoundRect(uiPx(18), uiPx(160), width - uiPx(36), uiPx(184),
+                        uiPx(12), TFT_BLACK);
   display.setTextDatum(textdatum_t::top_left);
   display.setTextColor(TFT_BLACK, gray(246));
   setUiFont(1, true);
-  display.drawString("灰阶  GRAY SCALE  0—15", 34, 172);
+  display.drawString("灰阶  GRAY SCALE  0—15", uiPx(34), uiPx(172));
   constexpr int kGrayCols = 4;
   constexpr int kGrayRows = 4;
-  constexpr int kGrayGap = 7;
-  const int gray_x = 34;
-  const int gray_y = 205;
-  const int gray_w = width - 68;
+  constexpr int kGrayGap = uiPx(7);
+  const int gray_x = uiPx(34);
+  const int gray_y = uiPx(205);
+  const int gray_w = width - uiPx(68);
   const int cell_w = (gray_w - (kGrayCols - 1) * kGrayGap) / kGrayCols;
-  const int cell_h = 28;
+  const int cell_h = uiPx(28);
   for (int index = 0; index < 16; ++index) {
     const int col = index % kGrayCols;
     const int row = index / kGrayCols;
@@ -420,84 +496,101 @@ void drawStartupPattern()
     const int y = gray_y + row * (cell_h + kGrayGap);
     const uint8_t shade = static_cast<uint8_t>(index * 17);
     const uint32_t color = gray(shade);
-    display.fillRoundRect(x, y, cell_w, cell_h, 5, color);
-    display.drawRoundRect(x, y, cell_w, cell_h, 5, TFT_BLACK);
+    display.fillRoundRect(x, y, cell_w, cell_h, uiPx(5), color);
+    display.drawRoundRect(x, y, cell_w, cell_h, uiPx(5), TFT_BLACK);
     display.setFont(&fonts::Font2);
     display.setTextDatum(textdatum_t::middle_center);
     display.setTextColor(index < 8 ? TFT_WHITE : TFT_BLACK, color);
     display.drawString(String(index), x + cell_w / 2, y + cell_h / 2);
   }
 
-  constexpr int kDualY = 362;
-  constexpr int kDualH = 212;
-  constexpr int kGap = 14;
-  const int dual_w = (width - 36 - kGap) / 2;
-  display.fillRoundRect(18, kDualY, dual_w, kDualH, 12, gray(246));
-  display.drawRoundRect(18, kDualY, dual_w, kDualH, 12, TFT_BLACK);
-  display.fillRoundRect(18 + dual_w + kGap, kDualY, dual_w, kDualH, 12, gray(246));
-  display.drawRoundRect(18 + dual_w + kGap, kDualY, dual_w, kDualH, 12, TFT_BLACK);
+  constexpr int kDualY = uiPx(362);
+  constexpr int kDualH = uiPx(212);
+  constexpr int kGap = uiPx(14);
+  const int dual_w = (width - uiPx(36) - kGap) / 2;
+  display.fillRoundRect(uiPx(18), kDualY, dual_w, kDualH, uiPx(12), gray(246));
+  display.drawRoundRect(uiPx(18), kDualY, dual_w, kDualH, uiPx(12), TFT_BLACK);
+  display.fillRoundRect(uiPx(18) + dual_w + kGap, kDualY, dual_w, kDualH,
+                        uiPx(12), gray(246));
+  display.drawRoundRect(uiPx(18) + dual_w + kGap, kDualY, dual_w, kDualH,
+                        uiPx(12), TFT_BLACK);
 
   display.setTextDatum(textdatum_t::top_center);
   display.setTextColor(TFT_BLACK, gray(246));
   setUiFont(1, true);
-  display.drawString("棋盘格", 18 + dual_w / 2, kDualY + 12);
-  display.drawString("几何图形", 18 + dual_w + kGap + dual_w / 2, kDualY + 12);
+  display.drawString("棋盘格", uiPx(18) + dual_w / 2, kDualY + uiPx(12));
+  display.drawString("几何图形", uiPx(18) + dual_w + kGap + dual_w / 2,
+                     kDualY + uiPx(12));
 
-  const int checker_x = 18 + (dual_w - 128) / 2;
-  const int checker_y = kDualY + 54;
+  constexpr int kCheckerCell = uiPx(16);
+  constexpr int kCheckerSize = 8 * kCheckerCell;
+  const int checker_x = uiPx(18) + (dual_w - kCheckerSize) / 2;
+  const int checker_y = kDualY + uiPx(54);
   for (int row = 0; row < 8; ++row) {
     for (int col = 0; col < 8; ++col) {
-      display.fillRect(checker_x + col * 16, checker_y + row * 16, 16, 16,
+      display.fillRect(checker_x + col * kCheckerCell,
+                       checker_y + row * kCheckerCell,
+                       kCheckerCell, kCheckerCell,
                        ((row + col) & 1) ? TFT_BLACK : TFT_WHITE);
     }
   }
-  display.drawRect(checker_x, checker_y, 128, 128, TFT_BLACK);
+  display.drawRect(checker_x, checker_y, kCheckerSize, kCheckerSize, TFT_BLACK);
 
-  const int shape_x = 18 + dual_w + kGap;
+  const int shape_x = uiPx(18) + dual_w + kGap;
   const int shape_cx = shape_x + dual_w / 2;
-  display.drawCircle(shape_cx, kDualY + 98, 43, TFT_BLACK);
-  display.fillCircle(shape_cx, kDualY + 98, 19, gray(100));
-  display.drawTriangle(shape_x + 30, kDualY + 178, shape_cx, kDualY + 120,
-                       shape_x + dual_w - 30, kDualY + 178, TFT_BLACK);
-  display.drawRect(shape_x + 49, kDualY + 62, dual_w - 98, 126, TFT_BLACK);
+  display.drawCircle(shape_cx, kDualY + uiPx(98), uiPx(43), TFT_BLACK);
+  display.fillCircle(shape_cx, kDualY + uiPx(98), uiPx(19), gray(100));
+  display.drawTriangle(shape_x + uiPx(30), kDualY + uiPx(178), shape_cx,
+                       kDualY + uiPx(120), shape_x + dual_w - uiPx(30),
+                       kDualY + uiPx(178), TFT_BLACK);
+  display.drawRect(shape_x + uiPx(49), kDualY + uiPx(62),
+                   dual_w - uiPx(98), uiPx(126), TFT_BLACK);
 
-  display.fillRoundRect(18, 592, width - 36, 252, 12, gray(246));
-  display.drawRoundRect(18, 592, width - 36, 252, 12, TFT_BLACK);
+  display.fillRoundRect(uiPx(18), uiPx(592), width - uiPx(36), uiPx(252),
+                        uiPx(12), gray(246));
+  display.drawRoundRect(uiPx(18), uiPx(592), width - uiPx(36), uiPx(252),
+                        uiPx(12), TFT_BLACK);
   display.setTextDatum(textdatum_t::top_left);
   display.setTextColor(TFT_BLACK, gray(246));
   setUiFont(1, true);
-  display.drawString("线条 / 像素 / 对比度", 34, 604);
+  display.drawString("线条 / 像素 / 对比度", uiPx(34), uiPx(604));
   for (int step = 0; step < 16; ++step) {
-    const int y = 644 + step * 11;
-    display.drawLine(34, y, width - 34, 820 - step * 10, gray(step * 16));
+    const int y = uiPx(644) + step * uiPx(11);
+    display.drawLine(uiPx(34), y, width - uiPx(34),
+                     uiPx(820) - step * uiPx(10), gray(step * 16));
   }
-  for (int x = 40; x < width - 40; x += 8) {
-    display.drawFastVLine(x, 662, 142, (x & 8) ? TFT_BLACK : gray(190));
+  int stripe = 0;
+  for (int x = uiPx(40); x < width - uiPx(40); x += uiPx(8), ++stripe) {
+    display.drawFastVLine(x, uiPx(662), uiPx(142),
+                          (stripe & 1) ? TFT_BLACK : gray(190));
   }
-  display.fillRect(38, 790, width - 76, 24, TFT_BLACK);
-  display.drawFastHLine(38, 821, width - 76, TFT_BLACK);
+  display.fillRect(uiPx(38), uiPx(790), width - uiPx(76), uiPx(24), TFT_BLACK);
+  display.drawFastHLine(uiPx(38), uiPx(821), width - uiPx(76), TFT_BLACK);
 
-  display.fillRoundRect(18, 862, width - 36, 80, 12, TFT_BLACK);
+  display.fillRoundRect(uiPx(18), uiPx(862), width - uiPx(36), uiPx(80),
+                        uiPx(12), TFT_BLACK);
   display.setTextDatum(textdatum_t::middle_center);
   display.setTextColor(TFT_WHITE, TFT_BLACK);
   setUiFont(1, true);
-  display.drawString("目视检查屏幕完整性 · 3 秒后进入出厂测试", width / 2, 890);
+  display.drawString("目视检查屏幕完整性 · 3 秒后进入出厂测试",
+                     width / 2, uiPx(890));
   display.setFont(&fonts::Font2);
-  display.drawString("LILYGO  T5 E-PAPER BASIC", width / 2, 920);
+  display.drawString("LILYGO  T5 E-PAPER BASIC", width / 2, uiPx(920));
 }
 
 void drawSectionFrame(int y, int h, const char* title, const char* english)
 {
-  display.fillRoundRect(kCenterX, y, kCenterW, h, 14, TFT_WHITE);
-  display.drawRoundRect(kCenterX, y, kCenterW, h, 14, TFT_BLACK);
-  display.drawFastHLine(kCenterX + 14, y + 50, kCenterW - 28, TFT_BLACK);
+  display.fillRoundRect(kCenterX, y, kCenterW, h, uiPx(14), TFT_WHITE);
+  display.drawRoundRect(kCenterX, y, kCenterW, h, uiPx(14), TFT_BLACK);
+  display.drawFastHLine(kCenterX + uiPx(14), y + uiPx(50),
+                        kCenterW - uiPx(28), TFT_BLACK);
   display.setTextDatum(textdatum_t::top_left);
   display.setTextColor(TFT_BLACK, TFT_WHITE);
   setUiFont(1, true);
-  display.drawString(title, kCenterX + 18, y + 14);
+  display.drawString(title, kCenterX + uiPx(18), y + uiPx(14));
   display.setFont(&fonts::Font2);
   display.setTextDatum(textdatum_t::top_left);
-  display.drawString(english, kCenterX + 154, y + 18);
+  display.drawString(english, kCenterX + uiPx(154), y + uiPx(18));
 }
 
 void drawStatusBadge(int x, int y, int w, const String& text, bool dark,
@@ -505,18 +598,18 @@ void drawStatusBadge(int x, int y, int w, const String& text, bool dark,
 {
   const uint32_t background = dark ? TFT_BLACK : TFT_WHITE;
   const uint32_t foreground = dark ? TFT_WHITE : TFT_BLACK;
-  display.fillRoundRect(x, y, w, 30, 15, background);
-  display.drawRoundRect(x, y, w, 30, 15, TFT_BLACK);
-  display.drawRoundRect(x + 1, y + 1, w - 2, 28, 14, TFT_BLACK);
+  display.fillRoundRect(x, y, w, uiPx(30), uiPx(15), background);
+  display.drawRoundRect(x, y, w, uiPx(30), uiPx(15), TFT_BLACK);
+  display.drawRoundRect(x + 1, y + 1, w - 2, uiPx(28), uiPx(14), TFT_BLACK);
   display.setTextDatum(textdatum_t::middle_center);
   display.setTextColor(foreground, background);
   if (ascii_text) {
     display.setFont(&fonts::Font2);
-    display.setTextSize(1);
+    display.setTextSize(kUiScale);
   } else {
     setUiFont(1, true);
   }
-  display.drawString(text, x + w / 2, y + 15);
+  display.drawString(text, x + w / 2, y + uiPx(15));
 }
 
 const char* gaugeBadgeText()
@@ -553,48 +646,54 @@ String gaugeCurrentText()
 
 void drawGaugeBattery(int x, int y, int w, int h)
 {
-  display.fillRect(x, y, w + 7, h, TFT_WHITE);
-  display.drawRoundRect(x, y, w, h, 5, TFT_BLACK);
-  display.fillRect(x + w, y + h / 3, 7, h / 3, TFT_BLACK);
+  display.fillRect(x, y, w + uiPx(7), h, TFT_WHITE);
+  display.drawRoundRect(x, y, w, h, uiPx(5), TFT_BLACK);
+  display.fillRect(x + w, y + h / 3, uiPx(7), h / 3, TFT_BLACK);
   if (!gauge_info.valid) return;
 
-  const int inner_w = w - 8;
+  const int inner_w = w - uiPx(8);
   const int fill_w =
       inner_w * std::min<uint8_t>(gauge_info.soc, 100) / 100;
   if (fill_w > 0) {
-    display.fillRect(x + 4, y + 4, fill_w, h - 8, TFT_BLACK);
+    display.fillRect(x + uiPx(4), y + uiPx(4), fill_w,
+                     h - uiPx(8), TFT_BLACK);
   }
 }
 
 void drawMainHeader()
 {
-  display.fillRoundRect(kCenterX, kHeaderY, kCenterW, kHeaderH, 16, TFT_WHITE);
-  display.drawRoundRect(kCenterX, kHeaderY, kCenterW, kHeaderH, 16, TFT_BLACK);
-  display.fillRoundRect(kCenterX, kHeaderY, kCenterW, 70, 16, TFT_BLACK);
-  display.fillRect(kCenterX, kHeaderY + 54, kCenterW, 16, TFT_BLACK);
+  display.fillRoundRect(kCenterX, kHeaderY, kCenterW, kHeaderH,
+                        uiPx(16), TFT_WHITE);
+  display.drawRoundRect(kCenterX, kHeaderY, kCenterW, kHeaderH,
+                        uiPx(16), TFT_BLACK);
+  display.fillRoundRect(kCenterX, kHeaderY, kCenterW, uiPx(70),
+                        uiPx(16), TFT_BLACK);
+  display.fillRect(kCenterX, kHeaderY + uiPx(54), kCenterW, uiPx(16), TFT_BLACK);
 
   display.setTextDatum(textdatum_t::top_center);
   display.setTextColor(TFT_WHITE, TFT_BLACK);
   setUiFont(2, true);
-  display.drawString("出厂测试", kCenterX + kCenterW / 2, kHeaderY + 9);
+  display.drawString("出厂测试", kCenterX + kCenterW / 2, kHeaderY + uiPx(9));
   display.setFont(&fonts::Font2);
-  display.setTextSize(1);
+  display.setTextSize(kUiScale);
   display.setTextDatum(textdatum_t::top_left);
-  display.drawString("T5 E-PAPER BASIC", kCenterX + 18, kHeaderY + 49);
+  display.drawString("T5 E-PAPER BASIC", kCenterX + uiPx(18),
+                     kHeaderY + uiPx(49));
   display.setTextDatum(textdatum_t::top_right);
   display.drawString(String("EPD PASS | IO ") + (io_ready ? "PASS" : "CHECK"),
-                     kCenterX + kCenterW - 18, kHeaderY + 49);
+                     kCenterX + kCenterW - uiPx(18), kHeaderY + uiPx(49));
 
-  constexpr int kFirstDividerX = kCenterX + 140;
-  constexpr int kSecondDividerX = kCenterX + 288;
-  display.drawFastVLine(kFirstDividerX, kHeaderY + 82, 62, TFT_BLACK);
-  display.drawFastVLine(kSecondDividerX, kHeaderY + 82, 62, TFT_BLACK);
+  constexpr int kFirstDividerX = kCenterX + uiPx(140);
+  constexpr int kSecondDividerX = kCenterX + uiPx(288);
+  display.drawFastVLine(kFirstDividerX, kHeaderY + uiPx(82), uiPx(62), TFT_BLACK);
+  display.drawFastVLine(kSecondDividerX, kHeaderY + uiPx(82), uiPx(62), TFT_BLACK);
 
   display.setTextColor(TFT_BLACK, TFT_WHITE);
   display.setFont(&fonts::Font2);
   display.setTextDatum(textdatum_t::top_left);
-  display.drawString("AXP2602", kCenterX + 16, kHeaderY + 78);
-  drawStatusBadge(kCenterX + 16, kHeaderY + 100, 106, gaugeBadgeText(),
+  display.drawString("AXP2602", kCenterX + uiPx(16), kHeaderY + uiPx(78));
+  drawStatusBadge(kCenterX + uiPx(16), kHeaderY + uiPx(100), uiPx(106),
+                  gaugeBadgeText(),
                   gauge_ready && gauge_info.valid, true);
   display.setTextDatum(textdatum_t::top_left);
   display.setTextColor(TFT_BLACK, TFT_WHITE);
@@ -602,31 +701,37 @@ void drawMainHeader()
   const String chip_id =
       gauge_info.chip_id >= 0 ? String(gauge_info.chip_id, HEX) : "--";
   display.drawString(String("ID 0x") + chip_id + "  |  IRQ21",
-                     kCenterX + 16, kHeaderY + 135);
+                     kCenterX + uiPx(16), kHeaderY + uiPx(135));
 
   display.setFont(&fonts::Font0);
-  display.drawString("VBAT", kCenterX + 156, kHeaderY + 78);
+  display.drawString("VBAT", kCenterX + uiPx(156), kHeaderY + uiPx(78));
   display.setFont(&fonts::Font2);
-  display.drawString(gaugeVoltageText(), kCenterX + 156, kHeaderY + 89);
+  display.drawString(gaugeVoltageText(), kCenterX + uiPx(156),
+                     kHeaderY + uiPx(89));
   display.setFont(&fonts::Font0);
-  display.drawString("IBAT  (+CHG / -DSG)", kCenterX + 156, kHeaderY + 113);
+  display.drawString("IBAT  (+CHG / -DSG)", kCenterX + uiPx(156),
+                     kHeaderY + uiPx(113));
   display.setFont(&fonts::Font2);
-  display.drawString(gaugeCurrentText(), kCenterX + 156, kHeaderY + 124);
+  display.drawString(gaugeCurrentText(), kCenterX + uiPx(156),
+                     kHeaderY + uiPx(124));
 
-  drawGaugeBattery(kCenterX + 304, kHeaderY + 80, 55, 24);
+  drawGaugeBattery(kCenterX + uiPx(304), kHeaderY + uiPx(80),
+                   uiPx(55), uiPx(24));
   display.setFont(&fonts::Font2);
   display.setTextDatum(textdatum_t::top_left);
   display.drawString(gauge_info.valid ? String(gauge_info.soc) + "%" : "--",
-                     kCenterX + 374, kHeaderY + 83);
+                     kCenterX + uiPx(374), kHeaderY + uiPx(83));
   display.setTextDatum(textdatum_t::top_center);
-  display.drawString(gaugeStateText(), kCenterX + 358, kHeaderY + 110);
+  display.drawString(gaugeStateText(), kCenterX + uiPx(358),
+                     kHeaderY + uiPx(110));
   display.setFont(&fonts::Font0);
   const String health_temperature =
       gauge_info.valid
           ? String("SOH ") + gauge_info.soh + "%  |  T "
                 + String(gauge_info.die_temperature_c, 1) + "C"
           : "SOH --  |  T --";
-  display.drawString(health_temperature, kCenterX + 358, kHeaderY + 136);
+  display.drawString(health_temperature, kCenterX + uiPx(358),
+                     kHeaderY + uiPx(136));
 }
 
 const char* sdCardTypeName(uint8_t type)
@@ -651,17 +756,20 @@ void drawSdIcon(int x, int y, bool active)
 {
   const uint32_t fill = active ? TFT_BLACK : TFT_WHITE;
   const uint32_t text = active ? TFT_WHITE : TFT_BLACK;
-  display.fillRect(x, y + 12, 74, 92, fill);
-  display.fillTriangle(x + 50, y + 12, x + 74, y + 36, x + 74, y + 12, TFT_WHITE);
-  display.drawRect(x, y + 12, 74, 92, TFT_BLACK);
-  display.drawRect(x + 1, y + 13, 72, 90, active ? TFT_BLACK : TFT_WHITE);
+  display.fillRect(x, y + uiPx(12), uiPx(74), uiPx(92), fill);
+  display.fillTriangle(x + uiPx(50), y + uiPx(12), x + uiPx(74),
+                       y + uiPx(36), x + uiPx(74), y + uiPx(12), TFT_WHITE);
+  display.drawRect(x, y + uiPx(12), uiPx(74), uiPx(92), TFT_BLACK);
+  display.drawRect(x + 1, y + uiPx(13), uiPx(72), uiPx(90),
+                   active ? TFT_BLACK : TFT_WHITE);
   for (int pin = 0; pin < 5; ++pin) {
-    display.fillRect(x + 9 + pin * 11, y + 22, 6, 20, text);
+    display.fillRect(x + uiPx(9) + pin * uiPx(11), y + uiPx(22),
+                     uiPx(6), uiPx(20), text);
   }
   display.setTextDatum(textdatum_t::middle_center);
   display.setTextColor(text, fill);
   display.setFont(&fonts::Font4);
-  display.drawString("SD", x + 37, y + 72);
+  display.drawString("SD", x + uiPx(37), y + uiPx(72));
 }
 
 void drawSdCard()
@@ -686,52 +794,56 @@ void drawSdCard()
       badge = "TEST";
       break;
   }
-  drawStatusBadge(kCenterX + kCenterW - 108, kSdY + 10, 88, badge, badge_dark, true);
-  drawSdIcon(kCenterX + 22, kSdY + 78, sd_result.state == SdState::kPassed);
+  drawStatusBadge(kCenterX + kCenterW - uiPx(108), kSdY + uiPx(10),
+                  uiPx(88), badge, badge_dark, true);
+  drawSdIcon(kCenterX + uiPx(22), kSdY + uiPx(78),
+             sd_result.state == SdState::kPassed);
 
   display.setTextDatum(textdatum_t::top_left);
   display.setTextColor(TFT_BLACK, TFT_WHITE);
   setUiFont(1);
-  const int info_x = kCenterX + 120;
-  const int info_y = kSdY + 69;
+  const int info_x = kCenterX + uiPx(120);
+  const int info_y = kSdY + uiPx(69);
 
   if (sd_result.state == SdState::kNoCard) {
     setUiFont(1, true);
-    display.drawString("未发现 SD 卡", info_x, info_y + 20);
+    display.drawString("未发现 SD 卡", info_x, info_y + uiPx(20));
     setUiFont(1);
-    display.drawString("请插入卡后重新测试", info_x, info_y + 58);
+    display.drawString("请插入卡后重新测试", info_x, info_y + uiPx(58));
     display.setFont(&fonts::Font2);
-    display.drawString("CARD DETECT: EMPTY", info_x, info_y + 92);
+    display.drawString("CARD DETECT: EMPTY", info_x, info_y + uiPx(92));
     return;
   }
 
   if (sd_result.state == SdState::kUnchecked) {
     setUiFont(1, true);
-    display.drawString("正在检测存储卡...", info_x, info_y + 38);
+    display.drawString("正在检测存储卡...", info_x, info_y + uiPx(38));
     display.setFont(&fonts::Font2);
-    display.drawString("MOUNT / WRITE / READ", info_x, info_y + 76);
+    display.drawString("MOUNT / WRITE / READ", info_x, info_y + uiPx(76));
     return;
   }
 
   if (sd_result.state == SdState::kFailed) {
     setUiFont(1, true);
-    display.drawString("SD 卡测试失败", info_x, info_y + 16);
+    display.drawString("SD 卡测试失败", info_x, info_y + uiPx(16));
     setUiFont(1);
-    display.drawString(fitText(sd_result.error, 270), info_x, info_y + 53);
+    display.drawString(fitText(sd_result.error, uiPx(270)), info_x,
+                       info_y + uiPx(53));
     display.setFont(&fonts::Font2);
-    display.drawString("CHECK CARD / FORMAT", info_x, info_y + 91);
+    display.drawString("CHECK CARD / FORMAT", info_x, info_y + uiPx(91));
     return;
   }
 
   display.drawString(String("类型：") + sd_result.card_type, info_x, info_y);
-  display.drawString(String("容量：") + formatCapacity(sd_result.card_bytes), info_x, info_y + 31);
+  display.drawString(String("容量：") + formatCapacity(sd_result.card_bytes),
+                     info_x, info_y + uiPx(31));
   display.drawString(String("空间：") + formatCapacity(sd_result.used_bytes) + " / "
                          + formatCapacity(sd_result.total_bytes),
-                     info_x, info_y + 62);
+                     info_x, info_y + uiPx(62));
   display.drawString(String("根目录：") + sd_result.directory_count + " 目录  "
                          + sd_result.file_count + " 文件",
-                     info_x, info_y + 93);
-  display.drawString("挂载：PASS   读写：PASS", info_x, info_y + 124);
+                     info_x, info_y + uiPx(93));
+  display.drawString("挂载：PASS   读写：PASS", info_x, info_y + uiPx(124));
 }
 
 int signalLevel(int32_t rssi)
@@ -746,14 +858,14 @@ void drawSignalBars(int x, int baseline_y, int32_t rssi, uint32_t foreground, ui
 {
   const int level = signalLevel(rssi);
   for (int bar = 0; bar < 4; ++bar) {
-    const int height = 5 + bar * 5;
-    const int bx = x + bar * 8;
+    const int height = uiPx(5) + bar * uiPx(5);
+    const int bx = x + bar * uiPx(8);
     const int by = baseline_y - height;
-    display.fillRect(bx, by, 5, height, background);
+    display.fillRect(bx, by, uiPx(5), height, background);
     if (bar < level) {
-      display.fillRect(bx, by, 5, height, foreground);
+      display.fillRect(bx, by, uiPx(5), height, foreground);
     } else {
-      display.drawRect(bx, by, 5, height, foreground);
+      display.drawRect(bx, by, uiPx(5), height, foreground);
     }
   }
 }
@@ -780,22 +892,25 @@ void drawNetworkRows(int first_y, size_t max_rows)
   if (rows == 0) {
     display.setTextColor(TFT_BLACK, TFT_WHITE);
     display.drawString(wifi_state == WifiState::kScanning ? "正在扫描附近 WiFi..." : "未扫描到 WiFi",
-                       kCenterX + 20, first_y + 18);
+                       kCenterX + uiPx(20), first_y + uiPx(18));
     return;
   }
 
   for (size_t index = 0; index < rows; ++index) {
-    const int y = first_y + static_cast<int>(index) * 34;
-    display.fillRect(kCenterX + 14, y, kCenterW - 28, 33, TFT_WHITE);
+    const int y = first_y + static_cast<int>(index) * uiPx(34);
+    display.fillRect(kCenterX + uiPx(14), y, kCenterW - uiPx(28),
+                     uiPx(33), TFT_WHITE);
     display.setTextColor(TFT_BLACK, TFT_WHITE);
     display.setFont(&fonts::Font2);
-    display.drawString(String(index + 1), kCenterX + 20, y + 16);
+    display.drawString(String(index + 1), kCenterX + uiPx(20), y + uiPx(16));
     setUiFont(1);
     String ssid = wifi_networks[index].ssid.length() ? wifi_networks[index].ssid : "<隐藏网络>";
-    display.drawString(fitText(ssid, 220), kCenterX + 48, y + 16);
+    display.drawString(fitText(ssid, uiPx(220)), kCenterX + uiPx(48),
+                       y + uiPx(16));
     display.setFont(&fonts::Font2);
-    display.drawString(String(wifi_networks[index].rssi) + " dBm", kCenterX + 292, y + 16);
-    drawSignalBars(kCenterX + 372, y + 27, wifi_networks[index].rssi,
+    display.drawString(String(wifi_networks[index].rssi) + " dBm",
+                       kCenterX + uiPx(292), y + uiPx(16));
+    drawSignalBars(kCenterX + uiPx(372), y + uiPx(27), wifi_networks[index].rssi,
                    TFT_BLACK, TFT_WHITE);
   }
 }
@@ -803,7 +918,8 @@ void drawNetworkRows(int first_y, size_t max_rows)
 void drawWifiCard()
 {
   drawSectionFrame(kWifiY, kWifiH, "WiFi 测试", "SCAN / CONNECT");
-  drawStatusBadge(kCenterX + kCenterW - 108, kWifiY + 10, 88, wifiBadgeText(),
+  drawStatusBadge(kCenterX + kCenterW - uiPx(108), kWifiY + uiPx(10),
+                  uiPx(88), wifiBadgeText(),
                   wifi_state == WifiState::kConnected);
 
   display.setTextDatum(textdatum_t::top_left);
@@ -811,36 +927,45 @@ void drawWifiCard()
   setUiFont(1);
 
   if (wifi_state == WifiState::kConnected) {
-    const int panel_y = kWifiY + 62;
-    display.fillRoundRect(kCenterX + 14, panel_y, kCenterW - 28, 108, 10, TFT_BLACK);
+    const int panel_y = kWifiY + uiPx(62);
+    display.fillRoundRect(kCenterX + uiPx(14), panel_y, kCenterW - uiPx(28),
+                          uiPx(108), uiPx(10), TFT_BLACK);
     display.setTextColor(TFT_WHITE, TFT_BLACK);
     setUiFont(1, true);
-    display.drawString(fitText(connected_ssid, 290), kCenterX + 32, panel_y + 14);
+    display.drawString(fitText(connected_ssid, uiPx(290)),
+                       kCenterX + uiPx(32), panel_y + uiPx(14));
     setUiFont(1);
-    display.drawString(String("IP 地址：") + connected_ip, kCenterX + 32, panel_y + 47);
-    display.drawString(String("信号：") + connected_rssi + " dBm", kCenterX + 32, panel_y + 76);
-    drawSignalBars(kCenterX + 353, panel_y + 83, connected_rssi, TFT_WHITE, TFT_BLACK);
+    display.drawString(String("IP 地址：") + connected_ip,
+                       kCenterX + uiPx(32), panel_y + uiPx(47));
+    display.drawString(String("信号：") + connected_rssi + " dBm",
+                       kCenterX + uiPx(32), panel_y + uiPx(76));
+    drawSignalBars(kCenterX + uiPx(353), panel_y + uiPx(83),
+                   connected_rssi, TFT_WHITE, TFT_BLACK);
 
     display.setTextColor(TFT_BLACK, TFT_WHITE);
     setUiFont(1, true);
     display.drawString(String("附近网络（按信号排序，共 ") + wifi_network_count + " 个）",
-                       kCenterX + 18, kWifiY + 181);
-    drawNetworkRows(kWifiY + 211, 5);
+                       kCenterX + uiPx(18), kWifiY + uiPx(181));
+    drawNetworkRows(kWifiY + uiPx(211), 5);
     return;
   }
 
-  int list_y = kWifiY + 96;
+  int list_y = kWifiY + uiPx(96);
   if (wifi_state == WifiState::kScanning) {
-    display.drawString("正在扫描附近 WiFi，请稍候...", kCenterX + 20, kWifiY + 65);
+    display.drawString("正在扫描附近 WiFi，请稍候...",
+                       kCenterX + uiPx(20), kWifiY + uiPx(65));
   } else if (wifi_state == WifiState::kConnecting && active_wifi_target >= 0) {
     display.drawString(String("正在连接：") + kWifiTargets[active_wifi_target].ssid,
-                       kCenterX + 20, kWifiY + 65);
+                       kCenterX + uiPx(20), kWifiY + uiPx(65));
   } else if (wifi_state == WifiState::kScanOnly) {
-    display.drawString("未发现预设 WiFi，仅显示扫描结果", kCenterX + 20, kWifiY + 65);
+    display.drawString("未发现预设 WiFi，仅显示扫描结果",
+                       kCenterX + uiPx(20), kWifiY + uiPx(65));
   } else if (wifi_state == WifiState::kConnectFailed) {
-    display.drawString("预设 WiFi 连接失败，扫描结果如下", kCenterX + 20, kWifiY + 65);
+    display.drawString("预设 WiFi 连接失败，扫描结果如下",
+                       kCenterX + uiPx(20), kWifiY + uiPx(65));
   } else {
-    display.drawString("WiFi 扫描失败，请检查射频功能", kCenterX + 20, kWifiY + 65);
+    display.drawString("WiFi 扫描失败，请检查射频功能",
+                       kCenterX + uiPx(20), kWifiY + uiPx(65));
   }
   drawNetworkRows(list_y, 8);
 }
@@ -849,19 +974,23 @@ void drawSideButton(size_t visual_index)
 {
   const ButtonVisual& visual = kButtonVisuals[visual_index];
   const bool pressed = stable_input.buttons[visual.logical_index];
-  display.fillRoundRect(visual.x, visual.y, kButtonW, kButtonH, 8, TFT_WHITE);
-  display.drawRoundRect(visual.x, visual.y, kButtonW, kButtonH, 8, TFT_BLACK);
+  display.fillRoundRect(visual.x, visual.y, kButtonW, kButtonH,
+                        uiPx(8), TFT_WHITE);
+  display.drawRoundRect(visual.x, visual.y, kButtonW, kButtonH,
+                        uiPx(8), TFT_BLACK);
   if (pressed) {
-    display.drawRoundRect(visual.x + 3, visual.y + 3,
-                          kButtonW - 6, kButtonH - 6, 6, TFT_BLACK);
+    display.drawRoundRect(visual.x + uiPx(3), visual.y + uiPx(3),
+                          kButtonW - uiPx(6), kButtonH - uiPx(6),
+                          uiPx(6), TFT_BLACK);
   }
   display.setTextDatum(textdatum_t::middle_center);
   display.setTextColor(TFT_BLACK, TFT_WHITE);
   display.setFont(&fonts::Font2);
-  display.drawString(visual.label, visual.x + kButtonW / 2, visual.y + kButtonH / 2 - 7);
+  display.drawString(visual.label, visual.x + kButtonW / 2,
+                     visual.y + kButtonH / 2 - uiPx(7));
   display.setFont(&fonts::Font0);
   display.drawString(pressed ? "DOWN" : "UP", visual.x + kButtonW / 2,
-                     visual.y + kButtonH / 2 + 12);
+                     visual.y + kButtonH / 2 + uiPx(12));
 }
 
 void drawMainScreen()
@@ -879,10 +1008,10 @@ void drawMainScreen()
   display.setTextColor(TFT_BLACK, TFT_WHITE);
   setUiFont(1);
   display.drawString("BOOT：长按 2 秒休眠电量计 · 休眠时短按唤醒",
-                     display.width() / 2, 910);
+                     display.width() / 2, uiPx(910));
   display.setFont(&fonts::Font2);
   display.drawString("LILYGO FACTORY TEST  |  EPD / SD / WIFI / KEYS / AXP2602",
-                     display.width() / 2, 940);
+                     display.width() / 2, uiPx(940));
 }
 
 void refreshMainFull()
@@ -891,6 +1020,22 @@ void refreshMainFull()
   display.setEpdMode(lgfx::epd_quality);
   display.display();
   display.waitDisplay();
+}
+
+void clearStartupPatternGhosting()
+{
+#if FACTORY_TEST_PANEL_1216X684
+  // The startup page contains large gray areas. A forced black/white cycle
+  // neutralizes their charge before the mostly-white factory-test page.
+  Serial.println("[EPD] deep-cleaning startup pattern ghosting");
+  display.setEpdMode(lgfx::epd_quality);
+  display.fillScreen(TFT_BLACK);
+  display.display();
+  display.waitDisplay();
+  display.fillScreen(TFT_WHITE);
+  display.display();
+  display.waitDisplay();
+#endif
 }
 
 void refreshSdCard()
@@ -902,7 +1047,7 @@ void refreshSdCard()
 void refreshMainHeader()
 {
   drawMainHeader();
-  constexpr int kStaticHeaderH = 70;
+  constexpr int kStaticHeaderH = uiPx(70);
   refreshLogicalRect(kCenterX, kHeaderY + kStaticHeaderH, kCenterW,
                      kHeaderH - kStaticHeaderH, lgfx::epd_text);
   last_gauge_ui_ms = millis();
@@ -1513,6 +1658,7 @@ void setup()
   sampled_change_ms = millis();
   sd_result.state = SdState::kUnchecked;
   wifi_state = WifiState::kScanning;
+  clearStartupPatternGhosting();
   refreshMainFull();
 
   runSdTest(stable_input.card_inserted);
